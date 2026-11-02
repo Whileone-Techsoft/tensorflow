@@ -3531,12 +3531,30 @@ class Subgraph {
                                  BuiltinOperator_AVERAGE_POOL_2D, node_index));
 
     const TfLiteTensor& input_tensor = tensors[node->inputs->data[0]];
-    TF_LITE_ENSURE_STATUS(CheckTensorFloatType(
-        logging_context, input_tensor, node->inputs->data[0], node_index));
+    TF_LITE_ENSURE_STATUS(
+        CheckTensorFloatOrQInt8Type(delegate, logging_context, input_tensor,
+                                    node->inputs->data[0], node_index));
 
     const TfLiteTensor& output_tensor = tensors[node->outputs->data[0]];
-    TF_LITE_ENSURE_STATUS(CheckTensorFloatType(
-        logging_context, output_tensor, node->outputs->data[0], node_index));
+    TF_LITE_ENSURE_STATUS(
+        CheckTensorFloatOrQInt8Type(delegate, logging_context, output_tensor,
+                                    node->outputs->data[0], node_index));
+    const bool quantized = input_tensor.type == kTfLiteInt8;
+    if (quantized != (output_tensor.type == kTfLiteInt8)) {
+      TF_LITE_MAYBE_KERNEL_LOG(
+          logging_context,
+          "mismatching input and output types in %s node #%d",
+          EnumNameBuiltinOperator(BuiltinOperator_AVERAGE_POOL_2D), node_index);
+      return kTfLiteError;
+    }
+    if (quantized) {
+      TF_LITE_ENSURE_STATUS(CheckTensorShape(
+          logging_context, input_tensor, 4, node->inputs->data[0],
+          BuiltinOperator_AVERAGE_POOL_2D, node_index));
+      TF_LITE_ENSURE_STATUS(CheckTensorShape(
+          logging_context, output_tensor, 4, node->outputs->data[0],
+          BuiltinOperator_AVERAGE_POOL_2D, node_index));
+    }
 
     TF_LITE_ENSURE_STATUS(CheckPoolingParams(logging_context, pool_params,
                                              BuiltinOperator_AVERAGE_POOL_2D,
@@ -3554,15 +3572,55 @@ class Subgraph {
 
     if (subgraph != nullptr) {
       xnn_status status = xnn_status_success;
+      uint32_t input_id = input_output_tensors.at(node->inputs->data[0]);
+      uint32_t output_id = input_output_tensors.at(node->outputs->data[0]);
+      const uint32_t quantized_output_id = output_id;
+      if (quantized) {
+        // XNNPACK has no quantized average pooling: pool in fp32 between a
+        // dequantize and a requantize.
+        const std::array<size_t, 4> input_dims = {
+            static_cast<size_t>(input_tensor.dims->data[0]),
+            static_cast<size_t>(input_tensor.dims->data[1]),
+            static_cast<size_t>(input_tensor.dims->data[2]),
+            static_cast<size_t>(input_tensor.dims->data[3])};
+        const std::array<size_t, 4> output_dims = {
+            static_cast<size_t>(output_tensor.dims->data[0]),
+            static_cast<size_t>(output_tensor.dims->data[1]),
+            static_cast<size_t>(output_tensor.dims->data[2]),
+            static_cast<size_t>(output_tensor.dims->data[3])};
+        uint32_t fp32_input_id = XNN_INVALID_VALUE_ID;
+        uint32_t fp32_output_id = XNN_INVALID_VALUE_ID;
+        status = xnn_define_tensor_value(
+            subgraph, xnn_datatype_fp32, input_dims.size(), input_dims.data(),
+            /*data=*/nullptr, XNN_INVALID_VALUE_ID, /*flags=*/0,
+            &fp32_input_id);
+        if (status == xnn_status_success) {
+          status = xnn_define_tensor_value(
+              subgraph, xnn_datatype_fp32, output_dims.size(),
+              output_dims.data(), /*data=*/nullptr, XNN_INVALID_VALUE_ID,
+              /*flags=*/0, &fp32_output_id);
+        }
+        if (status == xnn_status_success) {
+          status = xnn_define_convert(subgraph, input_id, fp32_input_id,
+                                      /*flags=*/0);
+        }
+        if (status != xnn_status_success) {
+          TF_LITE_KERNEL_LOG(
+              logging_context, "failed to delegate %s node #%d",
+              EnumNameBuiltinOperator(BuiltinOperator_AVERAGE_POOL_2D),
+              node_index);
+          return kTfLiteError;
+        }
+        input_id = fp32_input_id;
+        output_id = fp32_output_id;
+      }
       if (pool_params->filter_height == 1 && pool_params->filter_width == 1) {
         xnn_unary_params clamp_params;
         clamp_params.clamp.min = output_min;
         clamp_params.clamp.max = output_max;
         status = xnn_define_unary(
             subgraph, xnn_unary_clamp, &clamp_params,
-            /*input_id=*/input_output_tensors.at(node->inputs->data[0]),
-            /*output_id=*/input_output_tensors.at(node->outputs->data[0]),
-            /*flags=*/0);
+            input_id, output_id, /*flags=*/0);
       } else {
         status = xnn_define_average_pooling_2d(
             subgraph,
@@ -3575,9 +3633,11 @@ class Subgraph {
             static_cast<uint32_t>(pool_params->stride_height),
             static_cast<uint32_t>(pool_params->stride_width), output_min,
             output_max,
-            /*input_id=*/input_output_tensors.at(node->inputs->data[0]),
-            /*output_id=*/input_output_tensors.at(node->outputs->data[0]),
-            flags);
+            input_id, output_id, flags);
+      }
+      if (status == xnn_status_success && quantized) {
+        status = xnn_define_convert(subgraph, output_id, quantized_output_id,
+                                    /*flags=*/0);
       }
       if (status != xnn_status_success) {
         TF_LITE_KERNEL_LOG(
